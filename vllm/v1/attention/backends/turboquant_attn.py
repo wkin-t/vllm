@@ -742,7 +742,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
         if _HAS_FLASH_ATTN and D <= 256:
-            output = torch.empty(q_len, Hq, D, device=device, dtype=query.dtype)
+            output = torch.empty(q_len, Hq, D, device=device, dtype=qdtype)
             cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
             cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
             flash_attn_varlen_func(
@@ -760,38 +760,109 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             return output
         else:
             # D > 256: FA2 unavailable on SM89 (max head_dim=256).
-            # Chunked SDPA limits peak allocation of the O(N²) score matrix.
             #
-            # For Q chunk [i:j], causal allows attending to K[0:j+cached_len].
-            # is_causal=True on shape (cs, max_k): mask[r][c] = (c <= r+i+cached_len).
+            # PyTorch SDPA Math backend expands K/V from (1, Hk, seq_len, D)
+            # to (1, Hq, seq_len, D) for GQA internally, allocating
+            # seq_len × Hq × D × 2 bytes regardless of Q chunk size.
+            # For Hq=16, D=512, seq_len=32K this is ~536 MB — too large.
             #
-            # Math backend allocates:
-            #   scores:      (1, Hq, CHUNK_Q, max_k) × 4 bytes
-            #   GQA K expand:(1, Hq, max_k, D)       × 2 bytes (if Hk < Hq)
-            # Both scale with seq_len×Hq. Pre-compute contiguous K/V to avoid
-            # hidden copies inside SDPA from non-contiguous transposed views.
-            q_t = query.transpose(0, 1).unsqueeze(0).contiguous()  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0).contiguous()  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0).contiguous()  # (1, Hk, seq_len, D)
+            # Solution: manual FlashAttention-style online softmax with
+            # chunked Q AND chunked K.  Only CHUNK_K rows of K are expanded
+            # at a time, keeping peak extra allocation << 32 MB.
+            #
+            # Algorithm (per Q chunk [qi:qj]):
+            #   m  = -inf    (running max over K, per query)
+            #   l  = 0       (running softmax denominator)
+            #   acc= 0       (running weighted V sum)
+            #   for K chunk [ki:kj]:
+            #     scores = Q_c @ K_c^T * scale        (float32)
+            #     causal mask: score[r,c] = -inf if ki+c > qi+r+cached_len
+            #     chunk_max  = max(scores, dim=-1)
+            #     m_new      = max(m, chunk_max)
+            #     l   = exp(m-m_new)*l + sum(exp(scores-m_new), dim=-1)
+            #     acc = exp(m-m_new)*acc + exp(scores-m_new) @ V_c
+            #     m   = m_new
+            #   out[qi:qj] = acc / l
+            head_ratio = Hq // Hk if Hk < Hq else 1
+
+            # k_full / v_full shape: (seq_len, Hk, D)
+            # Transpose to (Hk, seq_len, D) for efficient K-dim slicing.
+            k_t = k_full.permute(1, 0, 2).contiguous()  # (Hk, seq_len, D)
+            v_t = v_full.permute(1, 0, 2).contiguous()  # (Hk, seq_len, D)
             del k_full, v_full
+            q_t = query.permute(1, 0, 2).contiguous()   # (Hq, q_len, D)
 
-            # Target score allocation <= 8 MB: CHUNK_Q = 8MB // (seq_len × Hq × 4)
-            CHUNK_Q = max(1, min(512, (8 * 1024 * 1024) // (seq_len * Hq * 4)))
+            # Tile sizes: keep expanded K chunk <= 16 MB, scores <= 8 MB.
+            # K expand: head_ratio × CHUNK_K × D × 2 <= 16 MB
+            #   → CHUNK_K <= 16 MB / (head_ratio × D × 2)
+            # Scores:   Hq × CHUNK_Q × CHUNK_K × 4   <= 8 MB
+            #   → CHUNK_Q × CHUNK_K <= 8 MB / (Hq × 4)
+            CHUNK_K = max(1, min(512, (16 * 1024 * 1024) // (head_ratio * D * 2)))
+            CHUNK_Q = max(1, min(q_len, (8 * 1024 * 1024) // (Hq * CHUNK_K * 4)))
 
-            out = torch.empty_like(q_t)
-            for i in range(0, q_len, CHUNK_Q):
-                j = min(i + CHUNK_Q, q_len)
-                max_k = j + cached_len  # exclusive K upper bound for this Q chunk
-                out[:, :, i:j, :] = F.scaled_dot_product_attention(
-                    q_t[:, :, i:j, :],
-                    k_t[:, :, :max_k, :],
-                    v_t[:, :, :max_k, :],
-                    is_causal=True,
-                    scale=self.scale,
-                    enable_gqa=(Hk < Hq),
-                )
+            out = torch.empty_like(q_t)  # (Hq, q_len, D)
 
-            return out[0].transpose(0, 1)  # (q_len, Hq, D)
+            for qi in range(0, q_len, CHUNK_Q):
+                qj = min(qi + CHUNK_Q, q_len)
+                cs_q = qj - qi
+                q_c = q_t[:, qi:qj, :]  # (Hq, cs_q, D)
+
+                # Online softmax state (float32 for numerical stability)
+                m   = q_c.new_full((Hq, cs_q, 1), float('-inf'), dtype=torch.float32)
+                l   = q_c.new_zeros((Hq, cs_q, 1), dtype=torch.float32)
+                acc = q_c.new_zeros((Hq, cs_q, D), dtype=torch.float32)
+
+                # Queries [qi:qj] can attend to K positions 0..qj+cached_len-1
+                max_k_pos = qj + cached_len
+
+                for ki in range(0, max_k_pos, CHUNK_K):
+                    kj = min(ki + CHUNK_K, max_k_pos)
+                    cs_k = kj - ki
+
+                    # Expand K/V from Hk to Hq heads (GQA)
+                    # k_c_hk: (Hk, cs_k, D) → (Hq, cs_k, D)
+                    k_c_hk = k_t[:, ki:kj, :]          # (Hk, cs_k, D)
+                    if head_ratio > 1:
+                        k_c = k_c_hk.repeat_interleave(head_ratio, dim=0)
+                        v_c = v_t[:, ki:kj, :].repeat_interleave(head_ratio, dim=0)
+                    else:
+                        k_c = k_c_hk
+                        v_c = v_t[:, ki:kj, :]          # (Hq, cs_k, D)
+
+                    # Scores: (Hq, cs_q, cs_k) in float32
+                    scores = torch.matmul(
+                        q_c.float(), k_c.float().transpose(-1, -2)
+                    ) * self.scale  # (Hq, cs_q, cs_k)
+
+                    # Causal mask: query qi+r can attend to k ki+c iff ki+c <= qi+r+cached_len
+                    # Equivalently: c <= r + (qi - ki) + cached_len
+                    r = torch.arange(cs_q, device=device, dtype=torch.int32)
+                    c = torch.arange(cs_k, device=device, dtype=torch.int32)
+                    causal_limit = (qi - ki) + cached_len
+                    # mask[r, c] = True means MASKED (future token)
+                    mask = c.unsqueeze(0) > r.unsqueeze(1) + causal_limit
+                    scores.masked_fill_(mask.unsqueeze(0), float('-inf'))
+
+                    # Online softmax update
+                    chunk_max = scores.max(dim=-1, keepdim=True).values  # (Hq, cs_q, 1)
+                    chunk_max = torch.where(
+                        torch.isinf(chunk_max), m, chunk_max
+                    )  # skip all-masked chunks
+                    exp_scores = torch.exp(scores - chunk_max)  # (Hq, cs_q, cs_k)
+
+                    m_new = torch.maximum(m, chunk_max)
+                    correction = torch.exp(m - m_new)  # (Hq, cs_q, 1)
+                    l   = correction * l + exp_scores.sum(dim=-1, keepdim=True)
+                    acc = correction * acc + torch.matmul(
+                        exp_scores, v_c.float()
+                    )  # (Hq, cs_q, D)
+                    m = m_new
+
+                # Normalize and write output
+                out[:, qi:qj, :] = (acc / l.clamp(min=1e-10)).to(qdtype)
+
+            # Permute back to (q_len, Hq, D)
+            return out.permute(1, 0, 2).contiguous()  # (q_len, Hq, D)
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
