@@ -765,8 +765,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             #              = (c <= r + i + cached_len)
             # which equals the global causal mask for query at position i+r.
             #
-            # Chunk size: keep score matrix <= 32 MB per head in float32.
-            CHUNK_Q = max(1, min(512, (32 * 1024 * 1024) // (seq_len * 4)))
+            # Score tensor shape: (1, Hq, CHUNK_Q, max_k) × 4 bytes.
+            # Hq is included in the divisor because SDPA allocates scores for
+            # all Q heads simultaneously, even with enable_gqa=True.
+            # Target: keep total score allocation <= 32 MB.
+            CHUNK_Q = max(1, min(512, (32 * 1024 * 1024) // (seq_len * Hq * 4)))
 
             q_t = query.transpose(0, 1).unsqueeze(0)   # (1, Hq, q_len, D)
             k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
