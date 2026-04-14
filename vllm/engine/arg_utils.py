@@ -8,7 +8,7 @@ import functools
 import json
 import sys
 from collections.abc import Callable
-from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
+from dataclasses import MISSING, dataclass, fields, is_dataclass
 from itertools import permutations
 from types import UnionType
 from typing import (
@@ -70,7 +70,7 @@ from vllm.config.cache import (
     PrefixCachingHashAlgo,
 )
 from vllm.config.device import Device
-from vllm.config.kernel import IrOpPriorityConfig, MoEBackend
+from vllm.config.kernel import MoEBackend
 from vllm.config.lora import MaxLoRARanks
 from vllm.config.model import (
     ConvertOption,
@@ -112,7 +112,6 @@ from vllm.v1.sample.logits_processor import LogitsProcessor
 from vllm.version import __version__ as VLLM_VERSION
 
 if TYPE_CHECKING:
-    from vllm.config.quantization import OnlineQuantizationConfigArgs
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.model_loader import LoadFormats
     from vllm.usage.usage_lib import UsageContext
@@ -402,7 +401,6 @@ class EngineArgs:
     max_cudagraph_capture_size: int | None = get_field(
         CompilationConfig, "max_cudagraph_capture_size"
     )
-    ir_op_priority: IrOpPriorityConfig = get_field(KernelConfig, "ir_op_priority")
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
@@ -416,9 +414,6 @@ class EngineArgs:
     nnodes: int = ParallelConfig.nnodes
     node_rank: int = ParallelConfig.node_rank
     distributed_timeout_seconds: int | None = ParallelConfig.distributed_timeout_seconds
-    numa_bind: bool = ParallelConfig.numa_bind
-    numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
-    numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
@@ -487,7 +482,6 @@ class EngineArgs:
     hf_overrides: HfOverrides = get_field(ModelConfig, "hf_overrides")
     tokenizer_revision: str | None = ModelConfig.tokenizer_revision
     quantization: QuantizationMethods | str | None = ModelConfig.quantization
-    quantization_config: "dict[str, Any] | OnlineQuantizationConfigArgs | None" = None
     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
     enforce_eager: bool = ModelConfig.enforce_eager
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
@@ -610,10 +604,6 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
-    enable_mamba_cache_stochastic_rounding: bool = (
-        CacheConfig.enable_mamba_cache_stochastic_rounding
-    )
-    mamba_cache_philox_rounds: int = CacheConfig.mamba_cache_philox_rounds
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
@@ -663,15 +653,6 @@ class EngineArgs:
             self.weight_transfer_config = WeightTransferConfig(
                 **self.weight_transfer_config
             )
-        if isinstance(self.ir_op_priority, dict):
-            self.ir_op_priority = IrOpPriorityConfig(**self.ir_op_priority)
-
-        from vllm.config.quantization import resolve_online_quant_config
-
-        self.quantization_config = resolve_online_quant_config(
-            self.quantization, self.quantization_config
-        )
-
         # Setup plugins
         from vllm.plugins import load_general_plugins
 
@@ -864,13 +845,6 @@ class EngineArgs:
             "--distributed-timeout-seconds",
             **parallel_kwargs["distributed_timeout_seconds"],
         )
-        parallel_group.add_argument("--numa-bind", **parallel_kwargs["numa_bind"])
-        parallel_group.add_argument(
-            "--numa-bind-nodes", **parallel_kwargs["numa_bind_nodes"]
-        )
-        parallel_group.add_argument(
-            "--numa-bind-cpus", **parallel_kwargs["numa_bind_cpus"]
-        )
         parallel_group.add_argument(
             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
         )
@@ -1049,13 +1023,6 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
-        )
-        cache_group.add_argument(
-            "--enable-mamba-cache-stochastic-rounding",
-            **cache_kwargs["enable_mamba_cache_stochastic_rounding"],
-        )
-        cache_group.add_argument(
-            "--mamba-cache-philox-rounds", **cache_kwargs["mamba_cache_philox_rounds"]
         )
         cache_group.add_argument(
             "--kv-offloading-size", **cache_kwargs["kv_offloading_size"]
@@ -1315,7 +1282,6 @@ class EngineArgs:
             title="KernelConfig",
             description=KernelConfig.__doc__,
         )
-        kernel_group.add_argument("--ir-op-priority", **kernel_kwargs["ir_op_priority"])
         kernel_group.add_argument(
             "--enable-flashinfer-autotune",
             **kernel_kwargs["enable_flashinfer_autotune"],
@@ -1449,7 +1415,6 @@ class EngineArgs:
             tokenizer_revision=self.tokenizer_revision,
             max_model_len=self.max_model_len,
             quantization=self.quantization,
-            quantization_config=self.quantization_config,
             allow_deprecated_quantization=self.allow_deprecated_quantization,
             enforce_eager=self.enforce_eager,
             enable_return_routed_experts=self.enable_return_routed_experts,
@@ -1591,7 +1556,7 @@ class EngineArgs:
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context, model_config
         )
-        self._set_default_reasoning_config_args()
+
         sliding_window: int | None = None
         if not is_interleaved(model_config.hf_text_config):
             # Only set CacheConfig.sliding_window if the model is all sliding
@@ -1625,11 +1590,55 @@ class EngineArgs:
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             mamba_cache_mode=self.mamba_cache_mode,
-            enable_mamba_cache_stochastic_rounding=self.enable_mamba_cache_stochastic_rounding,
-            mamba_cache_philox_rounds=self.mamba_cache_philox_rounds,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )
+
+        # TurboQuant: auto-skip first/last 2 layers (boundary protection).
+        # These layers are most sensitive to quantization error.
+        # Users can add extra layers via --kv-cache-dtype-skip-layers.
+        # Disabled for hybrid models (attn+mamba) -- mixed page sizes break
+        # the required page size unification.
+        # Also skip boundary protection for models with heterogeneous head sizes
+        # (e.g. Gemma 4: SWA head_dim=256 vs global head_dim=512). Mixed head
+        # sizes create incompatible TQ and bf16 page sizes that cannot be unified.
+        _htc = model_config.hf_text_config
+        # Detect heterogeneous head dimensions (e.g. Gemma 4: SWA head_dim=256,
+        # global head_dim=512). Relies on HF config field names "global_head_dim"
+        # and "head_dim" — if these are renamed in future transformers versions,
+        # _has_hetero_heads will be False and boundary-skip may be incorrectly
+        # re-enabled, causing page size incompatibility.
+        _has_hetero_heads = (
+            hasattr(_htc, "global_head_dim")
+            and hasattr(_htc, "head_dim")
+            and _htc.global_head_dim != _htc.head_dim
+        )
+        if _has_hetero_heads:
+            logger.info(
+                "TurboQuant: detected heterogeneous head sizes "
+                "(global_head_dim=%s, head_dim=%s) — skipping auto boundary "
+                "layer protection to avoid page size incompatibility.",
+                _htc.global_head_dim, _htc.head_dim,
+            )
+        if (
+            resolved_cache_dtype.startswith("turboquant_")
+            and not model_config.is_hybrid
+            and not _has_hetero_heads
+        ):
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+
+            num_layers = model_config.hf_text_config.num_hidden_layers
+            boundary = TurboQuantConfig.get_boundary_skip_layers(num_layers)
+            existing = set(cache_config.kv_cache_dtype_skip_layers)
+            merged = sorted(existing | set(boundary), key=lambda x: int(x))
+            cache_config.kv_cache_dtype_skip_layers = merged
+            logger.info(
+                "TQ: skipping layers %s for boundary protection (num_layers=%d)",
+                merged,
+                num_layers,
+            )
 
         ray_runtime_env = None
         if is_ray_initialized():
@@ -1836,9 +1845,6 @@ class EngineArgs:
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
-            numa_bind=self.numa_bind,
-            numa_bind_nodes=self.numa_bind_nodes,
-            numa_bind_cpus=self.numa_bind_cpus,
         )
 
         speculative_config = self.create_speculative_config(
@@ -1943,22 +1949,6 @@ class EngineArgs:
             kernel_config.enable_flashinfer_autotune = self.enable_flashinfer_autotune
         if self.moe_backend != "auto":
             kernel_config.moe_backend = self.moe_backend
-
-        # Transfer top-level ir_op_priority into KernelConfig.ir_op_priority
-        for op_name, op_priority in asdict(self.ir_op_priority).items():
-            # Empty means unset
-            if not op_priority:
-                continue
-
-            # Priority cannot be set 2x for the same op
-            if getattr(kernel_config.ir_op_priority, op_name):
-                raise ValueError(
-                    f"Op priority for {op_name} specified via both ir_op_priority "
-                    f"and KernelConfig.ir_op_priority, only one allowed at a time."
-                )
-
-            # Set the attribute
-            setattr(kernel_config.ir_op_priority, op_name, op_priority)
 
         load_config = self.create_load_config()
 
@@ -2232,13 +2222,6 @@ class EngineArgs:
                 "disabling it for V1 backend."
             )
             self.enable_prefix_caching = False
-
-    def _set_default_reasoning_config_args(self):
-        if not self.reasoning_parser:
-            return
-        if self.reasoning_config is None:
-            self.reasoning_config = ReasoningConfig()
-        self.reasoning_config.reasoning_parser = self.reasoning_parser
 
     def _set_default_max_num_seqs_and_batched_tokens_args(
         self,
