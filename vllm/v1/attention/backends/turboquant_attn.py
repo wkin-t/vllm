@@ -726,15 +726,19 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             k_cached_trim = (
                 k_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
             )  # (cached_len, Hk, D)
+        del k_cached
 
         v_cached_trim = (
             v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
         )  # (cached_len, Hk, D)
+        del v_cached
 
         # Concatenate cached + current chunk K/V (match query dtype)
         qdtype = query.dtype
         k_full = torch.cat([k_cached_trim.to(qdtype), key_chunk], dim=0)
+        del k_cached_trim
         v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
+        del v_cached_trim
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
         if _HAS_FLASH_ATTN and D <= 256:
@@ -756,24 +760,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             return output
         else:
             # D > 256: FA2 unavailable on SM89 (max head_dim=256).
-            # Chunked SDPA avoids allocating the full O(q_len × seq_len)
-            # attention score matrix that the Math backend requires.
+            # Chunked SDPA limits peak allocation of the O(N²) score matrix.
             #
-            # For Q chunk [i:j], the causal constraint allows attending to
-            # K[0:j+cached_len].  With is_causal=True on shape (cs, max_k):
-            #   mask[r][c] = (c <= r + max_k - cs)
-            #              = (c <= r + i + cached_len)
-            # which equals the global causal mask for query at position i+r.
+            # For Q chunk [i:j], causal allows attending to K[0:j+cached_len].
+            # is_causal=True on shape (cs, max_k): mask[r][c] = (c <= r+i+cached_len).
             #
-            # Score tensor shape: (1, Hq, CHUNK_Q, max_k) × 4 bytes.
-            # Hq is included in the divisor because SDPA allocates scores for
-            # all Q heads simultaneously, even with enable_gqa=True.
-            # Target: keep total score allocation <= 32 MB.
-            CHUNK_Q = max(1, min(512, (32 * 1024 * 1024) // (seq_len * Hq * 4)))
+            # Math backend allocates:
+            #   scores:      (1, Hq, CHUNK_Q, max_k) × 4 bytes
+            #   GQA K expand:(1, Hq, max_k, D)       × 2 bytes (if Hk < Hq)
+            # Both scale with seq_len×Hq. Pre-compute contiguous K/V to avoid
+            # hidden copies inside SDPA from non-contiguous transposed views.
+            q_t = query.transpose(0, 1).unsqueeze(0).contiguous()  # (1, Hq, q_len, D)
+            k_t = k_full.transpose(0, 1).unsqueeze(0).contiguous()  # (1, Hk, seq_len, D)
+            v_t = v_full.transpose(0, 1).unsqueeze(0).contiguous()  # (1, Hk, seq_len, D)
+            del k_full, v_full
 
-            q_t = query.transpose(0, 1).unsqueeze(0)   # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
+            # Target score allocation <= 8 MB: CHUNK_Q = 8MB // (seq_len × Hq × 4)
+            CHUNK_Q = max(1, min(512, (8 * 1024 * 1024) // (seq_len * Hq * 4)))
 
             out = torch.empty_like(q_t)
             for i in range(0, q_len, CHUNK_Q):
