@@ -755,20 +755,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             return output
         else:
-            # SDPA fallback: expand KV for GQA, build causal mask
-            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
+            # SDPA fallback for head_dim > 256 (FA2 limit).
+            # Use is_causal=True: for Q shorter than K, PyTorch defines
+            # mask[i][j] = (j <= i + (seq_len_k - seq_len_q))
+            #             = (j <= i + cached_len)
+            # which is exactly our causal intent. This lets PyTorch choose
+            # FlashAttention or Efficient Attention backend instead of the
+            # O(N^2) Math backend that an explicit attn_mask forces.
+            q_t = query.transpose(0, 1).unsqueeze(0)   # (1, Hq, q_len, D)
             k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
             v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
-            q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
-            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            mask = k_pos <= q_pos  # (q_len, seq_len)
             out = F.scaled_dot_product_attention(
                 q_t,
                 k_t,
                 v_t,
-                attn_mask=mask,
+                is_causal=True,
                 scale=self.scale,
                 enable_gqa=(Hk < Hq),
             )  # (1, Hq, q_len, D)
