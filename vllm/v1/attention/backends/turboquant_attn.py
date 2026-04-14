@@ -755,24 +755,36 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             return output
         else:
-            # SDPA fallback for head_dim > 256 (FA2 limit).
-            # Use is_causal=True: for Q shorter than K, PyTorch defines
-            # mask[i][j] = (j <= i + (seq_len_k - seq_len_q))
-            #             = (j <= i + cached_len)
-            # which is exactly our causal intent. This lets PyTorch choose
-            # FlashAttention or Efficient Attention backend instead of the
-            # O(N^2) Math backend that an explicit attn_mask forces.
+            # D > 256: FA2 unavailable on SM89 (max head_dim=256).
+            # Chunked SDPA avoids allocating the full O(q_len × seq_len)
+            # attention score matrix that the Math backend requires.
+            #
+            # For Q chunk [i:j], the causal constraint allows attending to
+            # K[0:j+cached_len].  With is_causal=True on shape (cs, max_k):
+            #   mask[r][c] = (c <= r + max_k - cs)
+            #              = (c <= r + i + cached_len)
+            # which equals the global causal mask for query at position i+r.
+            #
+            # Chunk size: keep score matrix <= 32 MB per head in float32.
+            CHUNK_Q = max(1, min(512, (32 * 1024 * 1024) // (seq_len * 4)))
+
             q_t = query.transpose(0, 1).unsqueeze(0)   # (1, Hq, q_len, D)
             k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
             v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            out = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                is_causal=True,
-                scale=self.scale,
-                enable_gqa=(Hk < Hq),
-            )  # (1, Hq, q_len, D)
+
+            out = torch.empty_like(q_t)
+            for i in range(0, q_len, CHUNK_Q):
+                j = min(i + CHUNK_Q, q_len)
+                max_k = j + cached_len  # exclusive K upper bound for this Q chunk
+                out[:, :, i:j, :] = F.scaled_dot_product_attention(
+                    q_t[:, :, i:j, :],
+                    k_t[:, :, :max_k, :],
+                    v_t[:, :, :max_k, :],
+                    is_causal=True,
+                    scale=self.scale,
+                    enable_gqa=(Hk < Hq),
+                )
+
             return out[0].transpose(0, 1)  # (q_len, Hq, D)
 
     # ------------------------------------------------------------------ #
