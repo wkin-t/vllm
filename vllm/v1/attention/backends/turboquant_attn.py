@@ -46,6 +46,12 @@ _USE_STREAM_OVERLAP = os.environ.get("TQ_STREAM_OVERLAP", "0") == "1"
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
 
+# Maximum head_dim supported by flash_attn on this deployment (SM89/FA2).
+# FA2 caps at 256; FA3 on H100 also caps at 256 for standard distributions.
+# Update this constant if a future flash_attn release supports larger head dims,
+# so all dependent code paths are updated in one place.
+_FA_MAX_HEAD_DIM = 256
+
 from vllm.config.cache import CacheDType
 from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
@@ -524,7 +530,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
-        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len and D <= 256:
+        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len and D <= _FA_MAX_HEAD_DIM:
             output = torch.empty(N, Hq, D, device=query.device, dtype=query.dtype)
             flash_attn_varlen_func(
                 q=query,
@@ -570,7 +576,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
-                if _HAS_FLASH_ATTN and D <= 256:
+                if _HAS_FLASH_ATTN and D <= _FA_MAX_HEAD_DIM:
                     out = torch.empty_like(q_seq)
                     cu = torch.tensor(
                         [0, q_len], device=query.device, dtype=torch.int32
@@ -666,6 +672,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         Dequants previously cached K/V, concatenates with the current
         chunk's raw K/V, then runs flash_attn with causal masking.
         """
+        # This function uses Python for-loops and dynamic torch.arange calls
+        # whose shapes depend on runtime seq_len. It is incompatible with CUDA
+        # graph capture and must only be called from the prefill path (which
+        # vLLM never captures with AttentionCGSupport.UNIFORM_BATCH).
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "_continuation_prefill cannot run inside CUDA graph capture"
+        )
+
         q_len, Hq, D = query.shape
         Hk = key_chunk.shape[1]
         device = query.device
@@ -741,7 +755,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         del v_cached_trim
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
-        if _HAS_FLASH_ATTN and D <= 256:
+        if _HAS_FLASH_ATTN and D <= _FA_MAX_HEAD_DIM:
             output = torch.empty(q_len, Hq, D, device=device, dtype=qdtype)
             cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
             cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
@@ -759,7 +773,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             return output
         else:
-            # D > 256: FA2 unavailable on SM89 (max head_dim=256).
+            # D > _FA_MAX_HEAD_DIM: FA2 unavailable on SM89 (max head_dim=256).
+            # FA3 on H100 also caps at 256 for standard distributions; update
+            # _FA_MAX_HEAD_DIM if a future flash_attn release supports larger dims.
             #
             # PyTorch SDPA Math backend expands K/V from (1, Hk, seq_len, D)
             # to (1, Hq, seq_len, D) for GQA internally, allocating
@@ -797,6 +813,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             #   → CHUNK_K <= 16 MB / (head_ratio × D × 2)
             # Scores:   Hq × CHUNK_Q × CHUNK_K × 4   <= 8 MB
             #   → CHUNK_Q × CHUNK_K <= 8 MB / (Hq × 4)
+            # The min(512, ...) cap bounds the K-chunk grid size and register
+            # pressure in the GQA expand step; 512 is the effective ceiling
+            # for D >= 128 where the memory formula alone gives > 512.
             CHUNK_K = max(1, min(512, (16 * 1024 * 1024) // (head_ratio * D * 2)))
             CHUNK_Q = max(1, min(q_len, (8 * 1024 * 1024) // (Hq * CHUNK_K * 4)))
 
@@ -812,7 +831,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 l   = q_c.new_zeros((Hq, cs_q, 1), dtype=torch.float32)
                 acc = q_c.new_zeros((Hq, cs_q, D), dtype=torch.float32)
 
-                # Queries [qi:qj] can attend to K positions 0..qj+cached_len-1
+                # K-loop upper bound: the last query in this chunk (at index qj-1)
+                # can attend to K positions 0..qj-1+cached_len = max_k_pos-1.
+                # Using qj (not qi) is intentional — earlier queries in the chunk
+                # are correctly restricted by the per-position causal mask below,
+                # not by this loop bound.
                 max_k_pos = qj + cached_len
 
                 for ki in range(0, max_k_pos, CHUNK_K):
@@ -843,7 +866,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     mask = c.unsqueeze(0) > r.unsqueeze(1) + causal_limit
                     scores.masked_fill_(mask.unsqueeze(0), float('-inf'))
 
-                    # Online softmax update
+                    # Online softmax update.
+                    # When a K chunk is entirely masked (chunk_max = -inf), we
+                    # replace it with the running m so correction = exp(0) = 1
+                    # and exp_scores = 0, leaving the running state unchanged.
+                    # NaN safety: this substitution is safe because max_k_pos
+                    # guarantees the first K chunk (ki=0) always has valid
+                    # positions for every query (K position 0 <= cached_len for
+                    # any query), so m is finite before any all-masked chunk
+                    # can appear.
                     chunk_max = scores.max(dim=-1, keepdim=True).values  # (Hq, cs_q, 1)
                     chunk_max = torch.where(
                         torch.isinf(chunk_max), m, chunk_max
