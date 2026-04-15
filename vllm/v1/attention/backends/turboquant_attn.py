@@ -703,29 +703,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         val_data_bytes = self._val_data_bytes
         n_centroids = self._n_centroids
 
-        # Dequant cached K/V from TQ cache
-        # Allocate slightly over to align to block_size for the grid
-        alloc_len = math.ceil(cached_len / block_size) * block_size
-        k_cached = torch.zeros(1, Hk, alloc_len, D, dtype=torch.float16, device=device)
-        v_cached = torch.zeros(1, Hk, alloc_len, D, dtype=torch.float16, device=device)
+        qdtype = query.dtype
 
-        grid = (alloc_len, 1 * Hk)
-        _tq_full_dequant_kv[grid](
-            kv_cache,
-            block_table,
-            centroids.float(),
-            k_cached,
-            v_cached,
-            k_cached.stride(0),
-            k_cached.stride(1),
-            k_cached.stride(2),
-            v_cached.stride(0),
-            v_cached.stride(1),
-            v_cached.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            block_table.stride(0),
+        # Common kernel kwargs shared by all _tq_full_dequant_kv calls below.
+        _kw = dict(
             HEAD_DIM=D,
             BLOCK_SIZE=block_size,
             NUM_KV_HEADS=Hk,
@@ -742,36 +723,54 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             num_warps=4,
         )
 
-        # Inverse-rotate MSE keys back to original space
-        if not self.tq_config.key_fp8:
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D).float()
-            k_flat = k_flat @ Pi.float()
-            k_cached_trim = (
-                k_flat.to(torch.float16).reshape(Hk, cached_len, D).transpose(0, 1)
-            )  # (cached_len, Hk, D)
-        else:
-            k_cached_trim = (
-                k_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-            )  # (cached_len, Hk, D)
-        del k_cached
-
-        v_cached_trim = (
-            v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-        )  # (cached_len, Hk, D)
-        del v_cached
-
-        # Attention: q_len queries attending to seq_len K/V with causal mask.
-        # NOTE: For D > _FA_MAX_HEAD_DIM we deliberately avoid the upfront
-        # k_full/v_full concat to prevent OOM at large contexts.
-        # k_cached_trim is float16 (Triton output); qdtype is typically bf16.
-        # A .to(qdtype) on (96K, 2, 512) creates a 188 MB copy.  Allocating
-        # k_full THEN v_full while k_full is live requires ~376 MB new, but
-        # only ~260 MB is free on RTX 4090 with 96K context.
-        # For D <= _FA_MAX_HEAD_DIM (SWA layers, Hk=8) the footprint is half
-        # and flash_attn requires contiguous tensors, so we keep the concat.
-        qdtype = query.dtype
-
         if _HAS_FLASH_ATTN and D <= _FA_MAX_HEAD_DIM:
+            # ── FA2 path (D ≤ 256, SWA layers) ──────────────────────────────
+            # cached_len is already trimmed to ≤ sliding_window (≤ 1024) so the
+            # upfront allocation is tiny (a few MB).  Allocate K and V together,
+            # dequant in one kernel pass, then feed flash_attn_varlen_func.
+            alloc_len = math.ceil(cached_len / block_size) * block_size
+            k_cached = torch.zeros(1, Hk, alloc_len, D, dtype=torch.float16, device=device)
+            v_cached = torch.zeros(1, Hk, alloc_len, D, dtype=torch.float16, device=device)
+
+            grid = (alloc_len, 1 * Hk)
+            _tq_full_dequant_kv[grid](
+                kv_cache,
+                block_table,
+                centroids.float(),
+                k_cached,
+                v_cached,
+                k_cached.stride(0),
+                k_cached.stride(1),
+                k_cached.stride(2),
+                v_cached.stride(0),
+                v_cached.stride(1),
+                v_cached.stride(2),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                block_table.stride(0),
+                0,  # pos_offset=0 (full-range pass)
+                **_kw,
+            )
+
+            # Inverse-rotate MSE keys back to original space
+            if not self.tq_config.key_fp8:
+                k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D).float()
+                k_flat = k_flat @ Pi.float()
+                k_cached_trim = (
+                    k_flat.to(torch.float16).reshape(Hk, cached_len, D).transpose(0, 1)
+                )  # (cached_len, Hk, D)
+            else:
+                k_cached_trim = (
+                    k_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
+                )  # (cached_len, Hk, D)
+            del k_cached
+
+            v_cached_trim = (
+                v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
+            )  # (cached_len, Hk, D)
+            del v_cached
+
             k_full = torch.cat([k_cached_trim.to(qdtype), key_chunk], dim=0)
             del k_cached_trim
             v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
@@ -792,148 +791,182 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 out=output,
             )
             return output
-        else:
-            # D > _FA_MAX_HEAD_DIM: FA2 unavailable on SM89 (max head_dim=256).
-            # FA3 on H100 also caps at 256 for standard distributions; update
-            # _FA_MAX_HEAD_DIM if a future flash_attn release supports larger dims.
-            #
-            # Manual FlashAttention-style online softmax with chunked Q and K.
-            # Only CHUNK_K rows of K are materialized at a time, so peak extra
-            # allocation stays << 16 MB regardless of context length.
-            #
-            # K/V segmentation (avoids upfront concat):
-            #   positions [0, cached_len)       -> k_cached_trim / v_cached_trim
-            #   positions [cached_len, seq_len) -> key_chunk / val_chunk
-            # Dtype conversion happens per chunk (lazy), not upfront.
-            #
-            # Algorithm (per Q chunk [qi:qj]):
-            #   m  = -inf    (running max over K, per query)
-            #   l  = 0       (running softmax denominator)
-            #   acc= 0       (running weighted V sum)
-            #   for K chunk [ki:kj]:
-            #     scores = Q_c @ K_c^T * scale        (float32)
-            #     causal mask: score[r,c] = -inf if ki+c > qi+r+cached_len
-            #     chunk_max  = max(scores, dim=-1)
-            #     m_new      = max(m, chunk_max)
-            #     l   = exp(m-m_new)*l + sum(exp(scores-m_new), dim=-1)
-            #     acc = exp(m-m_new)*acc + exp(scores-m_new) @ V_c
-            #     m   = m_new
-            #   out[qi:qj] = acc / l
-            head_ratio = Hq // Hk if Hk < Hq else 1
 
-            q_t = query.permute(1, 0, 2).contiguous()   # (Hq, q_len, D)
+        # ── D > _FA_MAX_HEAD_DIM path (global layers, D=512) ─────────────────
+        # FA2 is unavailable for head_dim > 256 on SM89 (RTX 4090).  We use a
+        # manual FlashAttention-style online softmax with chunked K/V.
+        #
+        # Memory strategy: LAZY per-chunk decompression.
+        # We never allocate a full k_cached / v_cached tensor for the entire
+        # context.  Instead, each K-chunk and V-chunk is decompressed on demand
+        # inside the inner loop using K_ONLY=1 / V_ONLY=1 kernel passes with the
+        # new `pos_offset` parameter.  Peak extra allocation per chunk:
+        #   buf (Hk × CHUNK_K × D × 2 bytes) ≈ 2 × 512 × 512 × 2 = 1 MiB
+        # This fixes the 128K OOM where the old code tried to allocate
+        # k_cached (256 MiB) + v_cached (256 MiB) simultaneously.
+        head_ratio = Hq // Hk if Hk < Hq else 1
 
-            # Tile sizes: keep expanded K chunk <= 16 MB, scores <= 8 MB.
-            # K expand: head_ratio x CHUNK_K x D x 2 <= 16 MB
-            #   -> CHUNK_K <= 16 MB / (head_ratio x D x 2)
-            # Scores:   Hq x CHUNK_Q x CHUNK_K x 4   <= 8 MB
-            #   -> CHUNK_Q x CHUNK_K <= 8 MB / (Hq x 4)
-            # The min(512, ...) cap bounds the K-chunk grid size and register
-            # pressure in the GQA expand step; 512 is the effective ceiling
-            # for D >= 128 where the memory formula alone gives > 512.
-            CHUNK_K = max(1, min(512, (16 * 1024 * 1024) // (head_ratio * D * 2)))
-            CHUNK_Q = max(1, min(q_len, (8 * 1024 * 1024) // (Hq * CHUNK_K * 4)))
+        q_t = query.permute(1, 0, 2).contiguous()   # (Hq, q_len, D)
 
-            out = torch.empty_like(q_t)  # (Hq, q_len, D)
+        # Tile sizes: keep expanded K chunk ≤ 16 MB, scores ≤ 8 MB.
+        CHUNK_K = max(1, min(512, (16 * 1024 * 1024) // (head_ratio * D * 2)))
+        CHUNK_Q = max(1, min(q_len, (8 * 1024 * 1024) // (Hq * CHUNK_K * 4)))
 
-            for qi in range(0, q_len, CHUNK_Q):
-                qj = min(qi + CHUNK_Q, q_len)
-                cs_q = qj - qi
-                q_c = q_t[:, qi:qj, :]  # (Hq, cs_q, D)
+        out = torch.empty_like(q_t)  # (Hq, q_len, D)
 
-                # Online softmax state (float32 for numerical stability)
-                m   = q_c.new_full((Hq, cs_q, 1), float('-inf'), dtype=torch.float32)
-                l   = q_c.new_zeros((Hq, cs_q, 1), dtype=torch.float32)
-                acc = q_c.new_zeros((Hq, cs_q, D), dtype=torch.float32)
+        # ── Helper closures for lazy decompression ───────────────────────────
 
-                # K-loop upper bound: the last query in this chunk (at index qj-1)
-                # can attend to K positions 0..qj-1+cached_len = max_k_pos-1.
-                # Using qj (not qi) is intentional -- earlier queries in the chunk
-                # are correctly restricted by the per-position causal mask below,
-                # not by this loop bound.
-                max_k_pos = qj + cached_len
+        def _decomp_k(pos_start: int, n: int) -> torch.Tensor:
+            """Decompress n K-vectors from cache[pos_start:pos_start+n].
+            Returns (n, Hk, D) in qdtype after WHT inverse rotation."""
+            buf = torch.empty(1, Hk, n, D, dtype=torch.float16, device=device)
+            _tq_full_dequant_kv[(n, Hk)](
+                kv_cache,
+                block_table,
+                centroids.float(),
+                buf,
+                buf,  # V_out_ptr unused (K_ONLY=1)
+                buf.stride(0),
+                buf.stride(1),
+                buf.stride(2),
+                buf.stride(0),  # V strides unused
+                buf.stride(1),
+                buf.stride(2),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                block_table.stride(0),
+                pos_start,
+                K_ONLY=1,
+                **_kw,
+            )
+            if not self.tq_config.key_fp8:
+                kf = buf[0].reshape(-1, D).float() @ Pi.float()
+                result = kf.to(qdtype).reshape(Hk, n, D).transpose(0, 1)
+                del kf
+            else:
+                result = buf[0].transpose(0, 1).contiguous().to(qdtype)
+            del buf
+            return result  # (n, Hk, D)
 
-                for ki in range(0, max_k_pos, CHUNK_K):
-                    kj = min(ki + CHUNK_K, max_k_pos)
-                    cs_k = kj - ki
+        def _decomp_v(pos_start: int, n: int) -> torch.Tensor:
+            """Decompress n V-vectors from cache[pos_start:pos_start+n].
+            Returns (n, Hk, D) in qdtype."""
+            buf = torch.empty(1, Hk, n, D, dtype=torch.float16, device=device)
+            _tq_full_dequant_kv[(n, Hk)](
+                kv_cache,
+                block_table,
+                centroids.float(),
+                buf,  # K_out_ptr unused (V_ONLY=1)
+                buf,
+                buf.stride(0),  # K strides unused
+                buf.stride(1),
+                buf.stride(2),
+                buf.stride(0),
+                buf.stride(1),
+                buf.stride(2),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                block_table.stride(0),
+                pos_start,
+                V_ONLY=1,
+                **_kw,
+            )
+            result = buf[0].transpose(0, 1).contiguous().to(qdtype)
+            del buf
+            return result  # (n, Hk, D)
 
-                    # Source K/V from the correct segment (no upfront concat):
-                    #   [0, cached_len)       -> TQ-decompressed cache (float16)
-                    #   [cached_len, seq_len) -> current input chunk (qdtype)
-                    # The boundary case (straddles both) fires at most once per
-                    # Q-chunk and allocates only CHUNK_K rows.
-                    if kj <= cached_len:
-                        k_c_seq = k_cached_trim[ki:kj].to(qdtype)  # (cs_k, Hk, D)
-                        v_c_seq = v_cached_trim[ki:kj].to(qdtype)
-                    elif ki >= cached_len:
-                        off = ki - cached_len
-                        k_c_seq = key_chunk[off:off + cs_k]         # already qdtype
-                        v_c_seq = val_chunk[off:off + cs_k]
-                    else:
-                        # Boundary chunk: straddles cached and current tokens.
-                        k_c_seq = torch.cat([
-                            k_cached_trim[ki:cached_len].to(qdtype),
-                            key_chunk[:kj - cached_len],
-                        ], dim=0)
-                        v_c_seq = torch.cat([
-                            v_cached_trim[ki:cached_len].to(qdtype),
-                            val_chunk[:kj - cached_len],
-                        ], dim=0)
+        # ── Chunked online-softmax attention loop ────────────────────────────
+        for qi in range(0, q_len, CHUNK_Q):
+            qj = min(qi + CHUNK_Q, q_len)
+            cs_q = qj - qi
+            q_c = q_t[:, qi:qj, :]  # (Hq, cs_q, D)
 
-                    # Expand K/V from Hk to Hq heads (GQA)
-                    # k_c_hk: (Hk, cs_k, D) -> (Hq, cs_k, D)
-                    k_c_hk = k_c_seq.permute(1, 0, 2)
-                    v_c_hk = v_c_seq.permute(1, 0, 2)
-                    if head_ratio > 1:
-                        k_c = k_c_hk.repeat_interleave(head_ratio, dim=0)
-                        v_c = v_c_hk.repeat_interleave(head_ratio, dim=0)
-                    else:
-                        k_c = k_c_hk
-                        v_c = v_c_hk                                 # (Hq, cs_k, D)
+            # Online softmax state (float32 for numerical stability)
+            m   = q_c.new_full((Hq, cs_q, 1), float('-inf'), dtype=torch.float32)
+            l   = q_c.new_zeros((Hq, cs_q, 1), dtype=torch.float32)
+            acc = q_c.new_zeros((Hq, cs_q, D), dtype=torch.float32)
 
-                    # Scores: (Hq, cs_q, cs_k) in float32
-                    scores = torch.matmul(
-                        q_c.float(), k_c.float().transpose(-1, -2)
-                    ) * self.scale  # (Hq, cs_q, cs_k)
+            # K-loop upper bound: the last query in this chunk (at index qj-1)
+            # can attend to K positions 0..qj-1+cached_len = max_k_pos-1.
+            max_k_pos = qj + cached_len
 
-                    # Causal mask: query qi+r can attend to k ki+c iff ki+c <= qi+r+cached_len
-                    # Equivalently: c <= r + (qi - ki) + cached_len
-                    r = torch.arange(cs_q, device=device, dtype=torch.int32)
-                    c = torch.arange(cs_k, device=device, dtype=torch.int32)
-                    causal_limit = (qi - ki) + cached_len
-                    # mask[r, c] = True means MASKED (future token)
-                    mask = c.unsqueeze(0) > r.unsqueeze(1) + causal_limit
-                    scores.masked_fill_(mask.unsqueeze(0), float('-inf'))
+            for ki in range(0, max_k_pos, CHUNK_K):
+                kj_k = min(ki + CHUNK_K, max_k_pos)
+                cs_k = kj_k - ki
 
-                    # Online softmax update.
-                    # When a K chunk is entirely masked (chunk_max = -inf), we
-                    # replace it with the running m so correction = exp(0) = 1
-                    # and exp_scores = 0, leaving the running state unchanged.
-                    # NaN safety: this substitution is safe because max_k_pos
-                    # guarantees the first K chunk (ki=0) always has valid
-                    # positions for every query (K position 0 <= cached_len for
-                    # any query), so m is finite before any all-masked chunk
-                    # can appear.
-                    chunk_max = scores.max(dim=-1, keepdim=True).values  # (Hq, cs_q, 1)
-                    chunk_max = torch.where(
-                        torch.isinf(chunk_max), m, chunk_max
-                    )  # skip all-masked chunks
-                    exp_scores = torch.exp(scores - chunk_max)  # (Hq, cs_q, cs_k)
+                # Source K/V from the correct segment (lazy decompression for cache):
+                #   [0, cached_len)       -> TQ-decompressed on demand (float16)
+                #   [cached_len, seq_len) -> current input chunk (qdtype)
+                if kj_k <= cached_len:
+                    # Pure cached chunk
+                    k_c_seq = _decomp_k(ki, cs_k)
+                    v_c_seq = _decomp_v(ki, cs_k)
+                elif ki >= cached_len:
+                    # Pure current-input chunk
+                    off = ki - cached_len
+                    k_c_seq = key_chunk[off:off + cs_k]   # already qdtype
+                    v_c_seq = val_chunk[off:off + cs_k]
+                else:
+                    # Boundary chunk: straddles cached and current tokens.
+                    n_c = cached_len - ki
+                    n_n = kj_k - cached_len
+                    k_c_seq = torch.cat([
+                        _decomp_k(ki, n_c),
+                        key_chunk[:n_n],
+                    ], dim=0)
+                    v_c_seq = torch.cat([
+                        _decomp_v(ki, n_c),
+                        val_chunk[:n_n],
+                    ], dim=0)
 
-                    m_new = torch.maximum(m, chunk_max)
-                    correction = torch.exp(m - m_new)  # (Hq, cs_q, 1)
-                    l   = correction * l + exp_scores.sum(dim=-1, keepdim=True)
-                    acc = correction * acc + torch.matmul(
-                        exp_scores, v_c.float()
-                    )  # (Hq, cs_q, D)
-                    m = m_new
+                # Expand K/V from Hk to Hq heads (GQA)
+                k_c_hk = k_c_seq.permute(1, 0, 2)   # (Hk, cs_k, D)
+                v_c_hk = v_c_seq.permute(1, 0, 2)
+                if head_ratio > 1:
+                    k_c = k_c_hk.repeat_interleave(head_ratio, dim=0)
+                    v_c = v_c_hk.repeat_interleave(head_ratio, dim=0)
+                else:
+                    k_c = k_c_hk
+                    v_c = v_c_hk                          # (Hq, cs_k, D)
 
-                # Normalize and write output
-                out[:, qi:qj, :] = (acc / l.clamp(min=1e-10)).to(qdtype)
+                # Scores: (Hq, cs_q, cs_k) in float32
+                scores = torch.matmul(
+                    q_c.float(), k_c.float().transpose(-1, -2)
+                ) * self.scale
 
-            del k_cached_trim, v_cached_trim
-            # Permute back to (q_len, Hq, D)
-            return out.permute(1, 0, 2).contiguous()  # (q_len, Hq, D)
+                # Causal mask: query qi+r can attend to k ki+c iff ki+c <= qi+r+cached_len
+                r = torch.arange(cs_q, device=device, dtype=torch.int32)
+                c = torch.arange(cs_k, device=device, dtype=torch.int32)
+                causal_limit = (qi - ki) + cached_len
+                # mask[r, c] = True means MASKED (future token)
+                mask = c.unsqueeze(0) > r.unsqueeze(1) + causal_limit
+                scores.masked_fill_(mask.unsqueeze(0), float('-inf'))
+
+                # Online softmax update.
+                # When a K chunk is entirely masked (chunk_max = -inf), we
+                # replace it with the running m so correction = exp(0) = 1
+                # and exp_scores = 0, leaving the running state unchanged.
+                chunk_max = scores.max(dim=-1, keepdim=True).values  # (Hq, cs_q, 1)
+                chunk_max = torch.where(
+                    torch.isinf(chunk_max), m, chunk_max
+                )  # skip all-masked chunks
+                exp_scores = torch.exp(scores - chunk_max)  # (Hq, cs_q, cs_k)
+
+                m_new = torch.maximum(m, chunk_max)
+                correction = torch.exp(m - m_new)  # (Hq, cs_q, 1)
+                l   = correction * l + exp_scores.sum(dim=-1, keepdim=True)
+                acc = correction * acc + torch.matmul(
+                    exp_scores, v_c.float()
+                )  # (Hq, cs_q, D)
+                m = m_new
+
+            # Normalize and write output
+            out[:, qi:qj, :] = (acc / l.clamp(min=1e-10)).to(qdtype)
+
+        # Permute back to (q_len, Hq, D)
+        return out.permute(1, 0, 2).contiguous()  # (q_len, Hq, D)
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
     # ------------------------------------------------------------------ #

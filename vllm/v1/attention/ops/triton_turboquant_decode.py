@@ -332,6 +332,7 @@ def _tq_full_dequant_kv(
     stride_cache_pos,
     stride_cache_head,
     stride_bt_b,
+    pos_offset,  # cache position offset for sub-range decompression (0 for full pass)
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -345,15 +346,26 @@ def _tq_full_dequant_kv(
     BLOCK_D: tl.constexpr,
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    V_ONLY: tl.constexpr = 0,  # skip K output (K_out_ptr unused)
+    K_ONLY: tl.constexpr = 0,  # skip V output (V_out_ptr unused)
 ):
-    """Full dequant: reconstruct K (MSE centroids * norm or FP8) and V to fp16."""
-    pos = tl.program_id(0)
+    """Full dequant: reconstruct K (MSE centroids * norm or FP8) and V to fp16.
+
+    out_pos  = grid index (0-based output position in the output buffer)
+    cache_pos = out_pos + pos_offset  = absolute position in the KV cache
+
+    When pos_offset=0 (default) the behaviour is identical to the original kernel.
+    For sub-range decompression, set pos_offset=ki and launch grid=(kj-ki, Hk)
+    so each thread reads cache[ki+out_pos] but writes output[out_pos].
+    """
+    out_pos = tl.program_id(0)
+    cache_pos = out_pos + pos_offset  # absolute KV-cache position
     bh = tl.program_id(1)
     bid = bh // NUM_KV_HEADS
     hid = bh % NUM_KV_HEADS
 
-    page_idx = pos // BLOCK_SIZE
-    page_off = pos % BLOCK_SIZE
+    page_idx = cache_pos // BLOCK_SIZE
+    page_off = cache_pos % BLOCK_SIZE
     block_num = tl.load(Block_table_ptr + bid * stride_bt_b + page_idx)
     slot_base = (
         block_num * stride_cache_block
@@ -365,92 +377,94 @@ def _tq_full_dequant_kv(
     d_mask = d_offs < HEAD_DIM
 
     # === K dequant ===
-    ko_base = bid * stride_ko_b + hid * stride_ko_h + pos * stride_ko_s
-    if KEY_FP8:
-        k_raw = tl.load(KV_cache_ptr + slot_base + d_offs, mask=d_mask, other=0)
-        if FP8_E4B15:
-            k_recon = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
+    if not V_ONLY:
+        ko_base = bid * stride_ko_b + hid * stride_ko_h + out_pos * stride_ko_s
+        if KEY_FP8:
+            k_raw = tl.load(KV_cache_ptr + slot_base + d_offs, mask=d_mask, other=0)
+            if FP8_E4B15:
+                k_recon = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
+            else:
+                k_recon = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
         else:
-            k_recon = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
-    else:
-        # MSE unpack (3-bit or 4-bit) + norms
-        mse_bit_off = d_offs * MSE_BITS
-        mse_byte_idx = mse_bit_off // 8
-        mse_bit_shift = mse_bit_off % 8
-        mse_umask = (1 << MSE_BITS) - 1
+            # MSE unpack (3-bit or 4-bit) + norms
+            mse_bit_off = d_offs * MSE_BITS
+            mse_byte_idx = mse_bit_off // 8
+            mse_bit_shift = mse_bit_off % 8
+            mse_umask = (1 << MSE_BITS) - 1
 
-        mse_raw0 = tl.load(
-            KV_cache_ptr + slot_base + mse_byte_idx, mask=d_mask, other=0
-        ).to(tl.int32)
-        mse_raw1 = tl.load(
-            KV_cache_ptr + slot_base + mse_byte_idx + 1, mask=d_mask, other=0
-        ).to(tl.int32)
-        raw16 = mse_raw0 | (mse_raw1 << 8)
-        mse_idx = (raw16 >> mse_bit_shift) & mse_umask
+            mse_raw0 = tl.load(
+                KV_cache_ptr + slot_base + mse_byte_idx, mask=d_mask, other=0
+            ).to(tl.int32)
+            mse_raw1 = tl.load(
+                KV_cache_ptr + slot_base + mse_byte_idx + 1, mask=d_mask, other=0
+            ).to(tl.int32)
+            raw16 = mse_raw0 | (mse_raw1 << 8)
+            mse_idx = (raw16 >> mse_bit_shift) & mse_umask
 
-        k_mse = tl.load(Centroids_ptr + mse_idx, mask=d_mask, other=0.0)
+            k_mse = tl.load(Centroids_ptr + mse_idx, mask=d_mask, other=0.0)
 
-        # Norm correction: re-normalize centroid vector to unit norm
-        if NORM_CORRECTION:
-            c_norm_sq = tl.sum(tl.where(d_mask, k_mse * k_mse, 0.0), axis=0)
-            c_inv_norm = 1.0 / tl.sqrt(c_norm_sq + 1e-16)
-            k_mse = k_mse * c_inv_norm
+            # Norm correction: re-normalize centroid vector to unit norm
+            if NORM_CORRECTION:
+                c_norm_sq = tl.sum(tl.where(d_mask, k_mse * k_mse, 0.0), axis=0)
+                c_inv_norm = 1.0 / tl.sqrt(c_norm_sq + 1e-16)
+                k_mse = k_mse * c_inv_norm
 
-        # Norms at MSE_BYTES offset (no QJL bytes)
-        norm_base = slot_base + MSE_BYTES
-        n_lo = tl.load(KV_cache_ptr + norm_base).to(tl.uint16)
-        n_hi = tl.load(KV_cache_ptr + norm_base + 1).to(tl.uint16)
-        vec_norm = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            # Norms at MSE_BYTES offset (no QJL bytes)
+            norm_base = slot_base + MSE_BYTES
+            n_lo = tl.load(KV_cache_ptr + norm_base).to(tl.uint16)
+            n_hi = tl.load(KV_cache_ptr + norm_base + 1).to(tl.uint16)
+            vec_norm = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
 
-        k_recon = vec_norm * k_mse
-        tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
+            k_recon = vec_norm * k_mse
+            tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
 
     # === V dequant ===
-    val_base = slot_base + KPS
-    if VQB == 4:
-        vb_idx = d_offs // 2
-        vb_shift = (d_offs % 2) * 4
-        val_raw = tl.load(KV_cache_ptr + val_base + vb_idx, mask=d_mask, other=0).to(
-            tl.int32
-        )
-        v_idx = ((val_raw >> vb_shift) & 0xF).to(tl.float32)
+    if not K_ONLY:
+        val_base = slot_base + KPS
+        if VQB == 4:
+            vb_idx = d_offs // 2
+            vb_shift = (d_offs % 2) * 4
+            val_raw = tl.load(KV_cache_ptr + val_base + vb_idx, mask=d_mask, other=0).to(
+                tl.int32
+            )
+            v_idx = ((val_raw >> vb_shift) & 0xF).to(tl.float32)
 
-        sc_base = val_base + VAL_DATA_BYTES
-        sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
-        sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
-        v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
-        zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
-        v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        v_vals = v_idx * v_scale + v_zero
-    elif VQB == 3:
-        # 3-bit value unpack: 8 values per 3 bytes
-        val_bit_off = d_offs * 3
-        val_byte_idx = val_bit_off // 8
-        val_bit_shift = val_bit_off % 8
-        val_raw0 = tl.load(
-            KV_cache_ptr + val_base + val_byte_idx, mask=d_mask, other=0
-        ).to(tl.int32)
-        val_raw1 = tl.load(
-            KV_cache_ptr + val_base + val_byte_idx + 1, mask=d_mask, other=0
-        ).to(tl.int32)
-        raw16 = val_raw0 | (val_raw1 << 8)
-        v_idx = ((raw16 >> val_bit_shift) & 0x7).to(tl.float32)
+            sc_base = val_base + VAL_DATA_BYTES
+            sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
+            sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
+            v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
+            zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
+            v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            v_vals = v_idx * v_scale + v_zero
+        elif VQB == 3:
+            # 3-bit value unpack: 8 values per 3 bytes
+            val_bit_off = d_offs * 3
+            val_byte_idx = val_bit_off // 8
+            val_bit_shift = val_bit_off % 8
+            val_raw0 = tl.load(
+                KV_cache_ptr + val_base + val_byte_idx, mask=d_mask, other=0
+            ).to(tl.int32)
+            val_raw1 = tl.load(
+                KV_cache_ptr + val_base + val_byte_idx + 1, mask=d_mask, other=0
+            ).to(tl.int32)
+            raw16 = val_raw0 | (val_raw1 << 8)
+            v_idx = ((raw16 >> val_bit_shift) & 0x7).to(tl.float32)
 
-        sc_base = val_base + VAL_DATA_BYTES
-        sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
-        sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
-        v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
-        zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
-        v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        v_vals = v_idx * v_scale + v_zero
-    else:
-        v_vals = tl.zeros([BLOCK_D], dtype=tl.float32)
+            sc_base = val_base + VAL_DATA_BYTES
+            sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
+            sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
+            v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
+            zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
+            v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            v_vals = v_idx * v_scale + v_zero
+        else:
+            v_vals = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    vo_base = bid * stride_vo_b + hid * stride_vo_h + pos * stride_vo_s
-    tl.store(V_out_ptr + vo_base + d_offs, v_vals.to(tl.float16), mask=d_mask)
+        vo_base = bid * stride_vo_b + hid * stride_vo_h + out_pos * stride_vo_s
+        tl.store(V_out_ptr + vo_base + d_offs, v_vals.to(tl.float16), mask=d_mask)
 
 
 # ---------------------------------------------------------------------------
