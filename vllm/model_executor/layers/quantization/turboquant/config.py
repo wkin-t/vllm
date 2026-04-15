@@ -143,13 +143,32 @@ class TurboQuantConfig:
     def slot_size_aligned(self) -> int:
         """Slot size aligned for cross-head-size page divisibility.
 
-        Pads to max(2, head_dim // 64) so pages for different head sizes
-        (e.g. head=256 and head=512 in Gemma 4) satisfy the divisibility
-        constraint in unify_kv_cache_spec_page_size.
+        Two-step alignment for Gemma4's hybrid architecture (25x SWA at
+        head_dim=256, 5x global at head_dim=512, with Hk_swa=8, Hk_global=2):
 
-        head=256: align=4, slot=388, 388%4=0 -> 388 (unchanged)
-        head=512: align=8, slot=772, 772%8=4 -> 776 (+4 pad)
-        p_swa=16x8x388=49664, p_global=16x2x776=24832, ratio=2 OK.
+        Step 1 - basic alignment:
+          Pad to next multiple of max(2, head_dim//64) for natural word
+          alignment.
+            head=256: align=4 -> slot unchanged if already divisible
+            head=512: align=8 -> slot unchanged if already divisible
+
+        Step 2 - cross-layer page divisibility (head_dim=512 only):
+          vLLM's unify_kv_cache_spec_page_size requires page sizes across
+          all layers to be mutually divisible.  Page for a layer =
+          block_size x num_kv_heads x slot_aligned.  For page_swa to be
+          divisible by page_global we need:
+            (Hk_swa x slot_256) % (Hk_global x slot_512_aligned) == 0
+          i.e. slot_512_aligned must be a divisor of
+            (Hk_swa / Hk_global) x slot_256  =  4 x slot_256.
+          The simplest sufficient condition that holds for all Gemma4 presets
+          is: slot_512_aligned is a multiple of slot_256_aligned (n==2 for all
+          current presets, giving page ratio 8xslot_256 / (2x2xslot_256) = 2).
+
+        Preset examples (k8v4 / 4bit_nc / k3v4_nc / 3bit_nc):
+          head=256 slot: 388 / 264 / 232 / 200
+          head=512 raw:  772 / 520 / 456 / 392
+          head=512 after step-1: 776 / 520 / 456 / 392
+          head=512 final: 776 / 528 / 464 / 400   (= 2x the head=256 value)
         """
         # Validated head_dim values: {256, 512}. Others emit a warning.
         _VALIDATED = {256, 512}
@@ -161,10 +180,28 @@ class TurboQuantConfig:
                 "Verify page size divisibility manually before enabling TurboQuant.",
                 UserWarning, stacklevel=2,
             )
+
+        # Step 1: basic word alignment.
         s = self.slot_size
         alignment = max(2, self.head_dim // 64)
         remainder = s % alignment
-        return s if remainder == 0 else s + (alignment - remainder)
+        s = s if remainder == 0 else s + (alignment - remainder)
+
+        # Step 2: for head_dim=512, ensure s is a multiple of the head_dim=256
+        # slot so that page sizes satisfy the divisibility constraint across
+        # Gemma4's hybrid SWA/global layer types.
+        if self.head_dim == 512:
+            ref_slot = TurboQuantConfig(
+                head_dim=256,
+                key_quant_bits=self.key_quant_bits,
+                value_quant_bits=self.value_quant_bits,
+                norm_correction=self.norm_correction,
+            ).slot_size_aligned
+            remainder2 = s % ref_slot
+            if remainder2 != 0:
+                s += ref_slot - remainder2
+
+        return s
 
     @staticmethod
     def get_boundary_skip_layers(num_layers: int, n: int = 2) -> list[str]:
