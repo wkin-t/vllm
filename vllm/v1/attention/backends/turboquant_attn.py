@@ -747,15 +747,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         )  # (cached_len, Hk, D)
         del v_cached
 
-        # Concatenate cached + current chunk K/V (match query dtype)
+        # Attention: q_len queries attending to seq_len K/V with causal mask.
+        # NOTE: For D > _FA_MAX_HEAD_DIM we deliberately avoid the upfront
+        # k_full/v_full concat to prevent OOM at large contexts.
+        # k_cached_trim is float16 (Triton output); qdtype is typically bf16.
+        # A .to(qdtype) on (96K, 2, 512) creates a 188 MB copy.  Allocating
+        # k_full THEN v_full while k_full is live requires ~376 MB new, but
+        # only ~260 MB is free on RTX 4090 with 96K context.
+        # For D <= _FA_MAX_HEAD_DIM (SWA layers, Hk=8) the footprint is half
+        # and flash_attn requires contiguous tensors, so we keep the concat.
         qdtype = query.dtype
-        k_full = torch.cat([k_cached_trim.to(qdtype), key_chunk], dim=0)
-        del k_cached_trim
-        v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
-        del v_cached_trim
 
-        # Attention: q_len queries attending to seq_len K/V with causal mask
         if _HAS_FLASH_ATTN and D <= _FA_MAX_HEAD_DIM:
+            k_full = torch.cat([k_cached_trim.to(qdtype), key_chunk], dim=0)
+            del k_cached_trim
+            v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
+            del v_cached_trim
             output = torch.empty(q_len, Hq, D, device=device, dtype=qdtype)
             cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
             cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
@@ -777,14 +784,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # FA3 on H100 also caps at 256 for standard distributions; update
             # _FA_MAX_HEAD_DIM if a future flash_attn release supports larger dims.
             #
-            # PyTorch SDPA Math backend expands K/V from (1, Hk, seq_len, D)
-            # to (1, Hq, seq_len, D) for GQA internally, allocating
-            # seq_len × Hq × D × 2 bytes regardless of Q chunk size.
-            # For Hq=16, D=512, seq_len=32K this is ~536 MB — too large.
+            # Manual FlashAttention-style online softmax with chunked Q and K.
+            # Only CHUNK_K rows of K are materialized at a time, so peak extra
+            # allocation stays << 16 MB regardless of context length.
             #
-            # Solution: manual FlashAttention-style online softmax with
-            # chunked Q AND chunked K.  Only CHUNK_K rows of K are expanded
-            # at a time, keeping peak extra allocation << 32 MB.
+            # K/V segmentation (avoids upfront concat):
+            #   positions [0, cached_len)       -> k_cached_trim / v_cached_trim
+            #   positions [cached_len, seq_len) -> key_chunk / val_chunk
+            # Dtype conversion happens per chunk (lazy), not upfront.
             #
             # Algorithm (per Q chunk [qi:qj]):
             #   m  = -inf    (running max over K, per query)
@@ -801,18 +808,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             #   out[qi:qj] = acc / l
             head_ratio = Hq // Hk if Hk < Hq else 1
 
-            # k_full / v_full shape: (seq_len, Hk, D)
-            # Transpose to (Hk, seq_len, D) for efficient K-dim slicing.
-            k_t = k_full.permute(1, 0, 2).contiguous()  # (Hk, seq_len, D)
-            v_t = v_full.permute(1, 0, 2).contiguous()  # (Hk, seq_len, D)
-            del k_full, v_full
             q_t = query.permute(1, 0, 2).contiguous()   # (Hq, q_len, D)
 
             # Tile sizes: keep expanded K chunk <= 16 MB, scores <= 8 MB.
-            # K expand: head_ratio × CHUNK_K × D × 2 <= 16 MB
-            #   → CHUNK_K <= 16 MB / (head_ratio × D × 2)
-            # Scores:   Hq × CHUNK_Q × CHUNK_K × 4   <= 8 MB
-            #   → CHUNK_Q × CHUNK_K <= 8 MB / (Hq × 4)
+            # K expand: head_ratio x CHUNK_K x D x 2 <= 16 MB
+            #   -> CHUNK_K <= 16 MB / (head_ratio x D x 2)
+            # Scores:   Hq x CHUNK_Q x CHUNK_K x 4   <= 8 MB
+            #   -> CHUNK_Q x CHUNK_K <= 8 MB / (Hq x 4)
             # The min(512, ...) cap bounds the K-chunk grid size and register
             # pressure in the GQA expand step; 512 is the effective ceiling
             # for D >= 128 where the memory formula alone gives > 512.
@@ -833,7 +835,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
                 # K-loop upper bound: the last query in this chunk (at index qj-1)
                 # can attend to K positions 0..qj-1+cached_len = max_k_pos-1.
-                # Using qj (not qi) is intentional — earlier queries in the chunk
+                # Using qj (not qi) is intentional -- earlier queries in the chunk
                 # are correctly restricted by the per-position causal mask below,
                 # not by this loop bound.
                 max_k_pos = qj + cached_len
@@ -842,15 +844,39 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     kj = min(ki + CHUNK_K, max_k_pos)
                     cs_k = kj - ki
 
+                    # Source K/V from the correct segment (no upfront concat):
+                    #   [0, cached_len)       -> TQ-decompressed cache (float16)
+                    #   [cached_len, seq_len) -> current input chunk (qdtype)
+                    # The boundary case (straddles both) fires at most once per
+                    # Q-chunk and allocates only CHUNK_K rows.
+                    if kj <= cached_len:
+                        k_c_seq = k_cached_trim[ki:kj].to(qdtype)  # (cs_k, Hk, D)
+                        v_c_seq = v_cached_trim[ki:kj].to(qdtype)
+                    elif ki >= cached_len:
+                        off = ki - cached_len
+                        k_c_seq = key_chunk[off:off + cs_k]         # already qdtype
+                        v_c_seq = val_chunk[off:off + cs_k]
+                    else:
+                        # Boundary chunk: straddles cached and current tokens.
+                        k_c_seq = torch.cat([
+                            k_cached_trim[ki:cached_len].to(qdtype),
+                            key_chunk[:kj - cached_len],
+                        ], dim=0)
+                        v_c_seq = torch.cat([
+                            v_cached_trim[ki:cached_len].to(qdtype),
+                            val_chunk[:kj - cached_len],
+                        ], dim=0)
+
                     # Expand K/V from Hk to Hq heads (GQA)
-                    # k_c_hk: (Hk, cs_k, D) → (Hq, cs_k, D)
-                    k_c_hk = k_t[:, ki:kj, :]          # (Hk, cs_k, D)
+                    # k_c_hk: (Hk, cs_k, D) -> (Hq, cs_k, D)
+                    k_c_hk = k_c_seq.permute(1, 0, 2)
+                    v_c_hk = v_c_seq.permute(1, 0, 2)
                     if head_ratio > 1:
                         k_c = k_c_hk.repeat_interleave(head_ratio, dim=0)
-                        v_c = v_t[:, ki:kj, :].repeat_interleave(head_ratio, dim=0)
+                        v_c = v_c_hk.repeat_interleave(head_ratio, dim=0)
                     else:
                         k_c = k_c_hk
-                        v_c = v_t[:, ki:kj, :]          # (Hq, cs_k, D)
+                        v_c = v_c_hk                                 # (Hq, cs_k, D)
 
                     # Scores: (Hq, cs_q, cs_k) in float32
                     scores = torch.matmul(
@@ -892,9 +918,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # Normalize and write output
                 out[:, qi:qj, :] = (acc / l.clamp(min=1e-10)).to(qdtype)
 
+            del k_cached_trim, v_cached_trim
             # Permute back to (q_len, Hq, D)
             return out.permute(1, 0, 2).contiguous()  # (q_len, Hq, D)
-
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
     # ------------------------------------------------------------------ #
