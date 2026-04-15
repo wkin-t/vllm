@@ -686,6 +686,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         block_size = kv_cache.shape[1]
         BLOCK_D = triton.next_power_of_2(D)
 
+        # SWA window trimming: only decompress the last `sliding_window` tokens.
+        # SWA layers attend to at most `sliding_window` past tokens; older cached
+        # tokens are outside the attention window and can be skipped.
+        # This prevents OOM from decompressing full-context (seq_len, Hk, D) tensors
+        # e.g. (96K, 8, 256) = 375 MB for SWA layers at 96K context.
+        if self.sliding_window and cached_len > self.sliding_window:
+            skip_blocks = max(0, (cached_len - self.sliding_window) // block_size)
+            if skip_blocks > 0:
+                block_table = block_table[:, skip_blocks:]
+                cached_len -= skip_blocks * block_size
+                seq_len = cached_len + q_len
+
         mse_bytes = self._mse_bytes
         val_data_bytes = self._val_data_bytes
         n_centroids = self._n_centroids
