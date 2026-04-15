@@ -595,17 +595,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         out=out,
                     )
                 else:
-                    q_t = q_seq.transpose(0, 1).contiguous()
-                    k_t = k_seq.transpose(0, 1).contiguous()
-                    v_t = v_seq.transpose(0, 1).contiguous()
-                    out = F.scaled_dot_product_attention(
-                        q_t,
-                        k_t,
-                        v_t,
-                        is_causal=True,
-                        scale=self.scale,
-                        enable_gqa=use_gqa,
-                    ).transpose(0, 1)
+                    # D > _FA_MAX_HEAD_DIM (global layers, D=512).
+                    # SDPA materializes the full O(q_len^2 * Hq) attention
+                    # matrix, which OOMs for long sequences (e.g. 8K tokens:
+                    # 16×8K×8K×4B = 4 GiB). Reuse the chunked online softmax
+                    # from _continuation_prefill with cached_len=0 — no cached
+                    # K/V to dequant, only current-chunk raw K/V is accessed.
+                    out = self._continuation_prefill(
+                        q_seq,
+                        k_seq,
+                        v_seq,
+                        kv_cache,
+                        attn_metadata.block_table[i : i + 1],
+                        cached_len=0,
+                        seq_len=q_len,
+                        Pi=Pi,
+                        centroids=centroids,
+                    )
                 output[q_start:q_end] = out.to(query.dtype)
             else:
                 # Continuation chunk: tokens already stored to TQ cache
@@ -952,10 +958,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 chunk_max = torch.where(
                     torch.isinf(chunk_max), m, chunk_max
                 )  # skip all-masked chunks
-                exp_scores = torch.exp(scores - chunk_max)  # (Hq, cs_q, cs_k)
 
+                # IMPORTANT: m_new must be computed BEFORE exp_scores.
+                # exp_scores must be normalized by the global running max m_new,
+                # not the local chunk_max. When m_old > chunk_max, m_new = m_old
+                # and using chunk_max would inflate exp_scores by exp(m_old-chunk_max).
                 m_new = torch.maximum(m, chunk_max)
                 correction = torch.exp(m - m_new)  # (Hq, cs_q, 1)
+                exp_scores = torch.exp(scores - m_new)  # (Hq, cs_q, cs_k)
+
                 l   = correction * l + exp_scores.sum(dim=-1, keepdim=True)
                 acc = correction * acc + torch.matmul(
                     exp_scores, v_c.float()
