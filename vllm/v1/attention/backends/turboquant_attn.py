@@ -261,6 +261,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_heads = num_kv_heads
         self.num_kv_groups = num_heads // num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.sliding_window = sliding_window
 
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
